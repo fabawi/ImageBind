@@ -48,4 +48,4 @@ class DreamBoothDataset(Dataset):
 
         texts = data.load_and_transform_text([class_text], self.device)
 
-        return images, ModalityType.VISION, texts, ModalityType.TEXT
+        return images, ModalityType.VISION, texts, ModalityType.TEXT, self.class_to_idx[class_text]
