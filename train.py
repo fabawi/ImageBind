@@ -139,13 +139,13 @@ class ImageBindTrain(L.LightningModule):
             # Calculate and log metrics for each unique class
             for i, class_idx in enumerate(class_idx.unique()):
                 self.log(f"{mode}/{name}_class_{class_idx}_precision", precision[i].mean(),
-                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=True, batch_size=self.hparams.batch_size)
+                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=False, batch_size=self.hparams.batch_size)
                 self.log(f"{mode}/{name}_class_{class_idx}_recall", recall[i].mean(),
-                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=True, batch_size=self.hparams.batch_size)
+                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=False, batch_size=self.hparams.batch_size)
                 self.log(f"{mode}/{name}_class_{class_idx}_acc", accuracy[i].mean(),
-                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=True, batch_size=self.hparams.batch_size)
+                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=False, batch_size=self.hparams.batch_size)
                 self.log(f"{mode}/{name}_class_{class_idx}_f1", f1[i].mean(),
-                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=True, batch_size=self.hparams.batch_size)
+                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=False, batch_size=self.hparams.batch_size)
                 
     def info_nce_loss(self, batch, mode="train"):
 
@@ -299,6 +299,8 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.07, help="Temperature parameter for InfoNCE loss")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of workers for data loading")
     parser.add_argument("--self_contrast", action="store_true", help="Use self-contrast on the image modality")
+    parser.add_argument("--class_masking", action="store_true", help="Mask classes with the same id within the batch "
+                                                                     "to avoid selecting them as negatives")
 
     parser.add_argument("--lora", action="store_true", help="Use LoRA")
     parser.add_argument("--lora_rank", type=int, default=4, help="Rank of LoRA layers")
@@ -457,7 +459,7 @@ if __name__ == "__main__":
     model = ImageBindTrain(max_epochs=args.max_epochs, batch_size=args.batch_size, lr=args.lr,
                            weight_decay=args.weight_decay, momentum_betas=args.momentum_betas,
                            temperature=args.temperature,
-                           num_workers=args.num_workers, self_contrast=args.self_contrast,
+                           num_workers=args.num_workers, self_contrast=args.self_contrast, class_masking=args.class_masking,
                            lora=args.lora, lora_rank=args.lora_rank, lora_checkpoint_dir=args.lora_checkpoint_dir,
                            lora_layer_idxs=lora_layer_idxs if lora_layer_idxs else None,
                            lora_modality_names=lora_modality_names if lora_modality_names else None,
@@ -465,9 +467,9 @@ if __name__ == "__main__":
 
     if args.full_model_checkpointing:
         checkpointing = {"enable_checkpointing": args.full_model_checkpointing,
-                         "callbacks": [ModelCheckpoint(monitor="val_loss", dirpath=args.full_model_checkpoint_dir,
+                         "callbacks": [ModelCheckpoint(monitor="val/acc_top1_epoch", dirpath=args.full_model_checkpoint_dir,
                                                         filename="imagebind-{epoch:02d}-{val_loss:.2f}",
-                                                        save_last=True, mode="min")]}
+                                                        save_last=True, mode="max")]}
     else:
         checkpointing = {"enable_checkpointing": args.full_model_checkpointing,}
 
