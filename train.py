@@ -28,6 +28,7 @@ from lightning.pytorch import loggers as pl_loggers
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from torcheval.metrics import MulticlassPrecisionRecallCurve, MulticlassAccuracy, MulticlassF1Score
 from torch.utils.data import DataLoader, ConcatDataset
 import torchvision
 from torchvision import transforms
@@ -43,6 +44,13 @@ LOG_ON_STEP = True
 LOG_ON_EPOCH = True
 
 
+def unique_with_index(class_idx):
+    sorted_indices = torch.argsort(class_idx)
+    sorted_input = class_idx[sorted_indices]
+    first_occurrence = torch.cat((torch.tensor([True], device=class_idx.device), sorted_input[:-1] != sorted_input[1:]))
+    return sorted_input[first_occurrence], sorted_indices[first_occurrence]
+
+
 class ContrastiveTransformations:
     def __init__(self, base_transforms, n_views=2):
         self.base_transforms = base_transforms
@@ -54,7 +62,7 @@ class ContrastiveTransformations:
 
 class ImageBindTrain(L.LightningModule):
     def __init__(self, lr=5e-4, weight_decay=1e-4, max_epochs=500, batch_size=32, num_workers=4, seed=42, 
-                 self_contrast=False, temperature=0.07,  momentum_betas=(0.9, 0.95), 
+                 class_masking=False, self_contrast=False, temperature=0.07,  momentum_betas=(0.9, 0.95), 
                  lora=False, lora_rank=4, lora_checkpoint_dir="./.checkpoints/lora",
                  lora_layer_idxs=None, lora_modality_names=None,
                  linear_probing=False
@@ -106,16 +114,57 @@ class ImageBindTrain(L.LightningModule):
             optimizer, T_max=self.hparams.max_epochs, eta_min=self.hparams.lr / 50
         )
         return [optimizer], [lr_scheduler]
-
+        
+    def _calculate_and_log_class_metrics(self, sim, class_idx, mode, name, unique=False):
+        num_classes = int(max(class_idx))+1
+        accm = MulticlassAccuracy(average="micro", num_classes=num_classes, device=self.device)
+        accm.update(input=sim, target=class_idx)
+        accuracy = accm.compute()
+        # accuracy = sync_and_compute(accm)
+        self.log(f"{mode}/{name}_acc", accuracy, on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH,
+                 prog_bar=True, batch_size=self.hparams.batch_size)
+        if unique:
+            # Precision & Recall
+            prc = MulticlassPrecisionRecallCurve(num_classes=num_classes, device=self.device)
+            prc.update(input=sim, target=class_idx)
+            precision, recall, thresholds = prc.compute()
+            # F1Score
+            f1s = MulticlassF1Score(average=None, num_classes=num_classes, device=self.device)
+            f1s.update(input=sim, target=class_idx)
+            f1 = f1s.compute()
+            # Accuracy
+            accm = MulticlassAccuracy(average=None, num_classes=num_classes, device=self.device)
+            accm.update(input=sim, target=class_idx)
+            accuracy = accm.compute()
+            # Calculate and log metrics for each unique class
+            for i, class_idx in enumerate(class_idx.unique()):
+                self.log(f"{mode}/{name}_class_{class_idx}_precision", precision[i].mean(),
+                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=True, batch_size=self.hparams.batch_size)
+                self.log(f"{mode}/{name}_class_{class_idx}_recall", recall[i].mean(),
+                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=True, batch_size=self.hparams.batch_size)
+                self.log(f"{mode}/{name}_class_{class_idx}_acc", accuracy[i].mean(),
+                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=True, batch_size=self.hparams.batch_size)
+                self.log(f"{mode}/{name}_class_{class_idx}_f1", f1[i].mean(),
+                         on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, prog_bar=True, batch_size=self.hparams.batch_size)
+                
     def info_nce_loss(self, batch, mode="train"):
-        data_a, class_a, data_b, class_b = batch
 
-        # class_a is always "vision" according to ImageBind
-        feats_a = [self.model({class_a[0]: data_a_i}) for data_a_i in data_a]
+        data_a, modal_a, data_b, modal_b, class_idx = batch
+
+        feats_a = [self.model({modal_a[0]: data_a_i}) for data_a_i in data_a]
         feats_a_tensor = torch.cat([list(dict_.values())[0] for dict_ in feats_a], dim=0)
-        # class_b could be any modality
-        feats_b = [self.model({class_b[idx]: data_b_i}) for idx, data_b_i in enumerate(data_b)]
-        feats_b_tensor = torch.cat([list(dict_.values())[0] for dict_ in feats_b], dim=0)
+
+        if isinstance(data_b, list):
+            feats_b_list = []
+            for feats_b_idx in range(len(data_b)):
+                feats_b = [self.model({modal_b[feats_b_idx][idx]: data_b_i}) for idx, data_b_i in
+                           enumerate(data_b[feats_b_idx])]
+                feats_b_list.append(torch.cat([list(dict_.values())[0] for dict_ in feats_b], dim=0))
+            # feats_b_tensor is the mean of feats_b_list between modalities
+            feats_b_tensor = torch.stack(feats_b_list, dim=0).mean(dim=0)
+        else:
+            feats_b = [self.model({modal_b[idx]: data_b_i}) for idx, data_b_i in enumerate(data_b)]
+            feats_b_tensor = torch.cat([list(dict_.values())[0] for dict_ in feats_b], dim=0)
 
         if self.hparams.self_contrast:
             feats_a_b_tensor = torch.cat([feats_a_tensor.chunk(2)[0], feats_b_tensor], dim=0)
@@ -128,43 +177,78 @@ class ImageBindTrain(L.LightningModule):
             temperatures = [self.hparams.temperature]
             contrast = ["cross"]
 
-        # Accumulate self-contrastive loss for image and its augmentation, and modailty with image
         dual_nll = False
         for feats_idx, feats_tensor in enumerate(feats_tensors):
-            # Calculate cosine similarity
-            cos_sim = F.cosine_similarity(feats_tensor[:, None, :], feats_tensor[None, :, :], dim=-1)
-            # Mask out cosine similarity to itself
-            self_mask = torch.eye(cos_sim.shape[0], dtype=torch.bool, device=cos_sim.device)
-            cos_sim.masked_fill_(self_mask, -9e15)
-            # Find positive example -> batch_size//2 away from the original example
-            pos_mask = self_mask.roll(shifts=cos_sim.shape[0] // 2, dims=0)
-            # InfoNCE loss
-            cos_sim = cos_sim / temperatures[feats_idx]
-            nll = -cos_sim[pos_mask] + torch.logsumexp(cos_sim, dim=-1)
+            sim = F.cosine_similarity(feats_tensor[:, None, :], feats_tensor[None, :, :], dim=-1)
+            self_mask = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+            sim.masked_fill_(self_mask, -9e15)
+
+            # If class_masking is set to True, mask out similar classes
+            if self.hparams.class_masking:
+                # Create a mask for the same classes, where True means the pair is of the same class
+                class_mask = class_idx[:, None] == class_idx[None, :]
+                class_mask = class_mask.repeat(2, 2)
+                class_mask[self_mask.roll(shifts=sim.shape[0] // 2, dims=0)] = False  # Exclude diagonal elements
+                # Mask out similarities of same class pairs
+                sim.masked_fill_(class_mask, -9e15)
+
+            pos_mask = self_mask.roll(shifts=sim.shape[0] // 2, dims=0)
+            sim = sim / temperatures[feats_idx]
+            nll = -sim[pos_mask] + torch.logsumexp(sim, dim=-1)
             nll = nll.mean()
+
             if not dual_nll:
                 dual_nll = nll
             else:
                 dual_nll += nll
                 dual_nll /= 2
-            # Logging loss
-            self.log(mode + "_loss_" + contrast[feats_idx], nll, prog_bar=True,
-                     on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, batch_size=self.hparams.batch_size)
-            # Get ranking position of positive example
-            comb_sim = torch.cat(
-                [cos_sim[pos_mask][:, None], cos_sim.masked_fill(pos_mask, -9e15)],  # First position positive example
-                dim=-1,
-            )
-            sim_argsort = comb_sim.argsort(dim=-1, descending=True).argmin(dim=-1)
-            # Logging ranking metrics
-            self.log(mode + "_acc_top1", (sim_argsort == 0).float().mean(), prog_bar=True,
-                     on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, batch_size=self.hparams.batch_size)
-            self.log(mode + "_acc_top5", (sim_argsort < 5).float().mean(), prog_bar=True,
-                     on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, batch_size=self.hparams.batch_size)
-            self.log(mode + "_acc_mean_pos", 1 + sim_argsort.float().mean(), prog_bar=True,
+
+            self.log(f"{mode}/loss_" + contrast[feats_idx], nll, prog_bar=True,
                      on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, batch_size=self.hparams.batch_size)
 
-        self.log(mode + "_loss", dual_nll, prog_bar=True,
+            if self.hparams.class_masking:
+                comb_sim = torch.cat([sim[pos_mask][:, None], sim.masked_fill(class_mask + pos_mask, -9e15)], dim=-1)
+
+                ############################################ S. TEST #################################################
+                # Split the class indices, similarity matrix, and masks into two halves
+                half = sim.size(0) // 2
+                sim_a, sim_b = sim[:half, half:], sim[half:, :half]
+
+                # For the first half, calculate metrics for the image to x_modality comparisons
+                unique_class, unique_indices = unique_with_index(class_idx)
+                _, class_in_unique = torch.max((unique_class[None, :] == class_idx[:, None]).long(), dim=-1)
+
+                sim_ab_unique = sim_a[:, unique_indices]
+                sim_ab_unique[torch.arange(sim_ab_unique.shape[0]), class_in_unique] = torch.diag(sim_a)
+                sim_ab_unique_padded = torch.zeros(sim_a.shape[0], max(unique_class) + 1, device=self.device)
+                sim_ab_unique_padded.index_copy_(1, unique_class, sim_ab_unique)
+
+                # Calculate and log metrics for the first half
+                self._calculate_and_log_class_metrics(sim_ab_unique_padded, class_idx, mode, "first_half", unique=True)
+
+                # For the second half, calculate metrics for the x_modality to image comparisons
+                sim_ba_unique = sim_b[:, unique_indices]
+                sim_ba_unique[torch.arange(sim_ba_unique.shape[0]), class_in_unique] = torch.diag(sim_b)
+                sim_ba_unique_padded = torch.zeros(sim_b.shape[0], max(unique_class) + 1, device=self.device)
+                sim_ba_unique_padded.index_copy_(1, unique_class, sim_ba_unique)
+
+                # Calculate and log metrics for the second half
+                self._calculate_and_log_class_metrics(sim_ba_unique_padded, class_idx, mode, "second_half", unique=True)
+                ############################################ E. TEST #################################################
+            else:
+                comb_sim = torch.cat([sim[pos_mask][:, None], sim.masked_fill(pos_mask, -9e15)], dim=-1)
+            sim_argsort = comb_sim.argsort(dim=-1, descending=True).argmin(dim=-1)
+            acc_top1 = (sim_argsort == 0).float().mean()
+            acc_top5 = (sim_argsort < 5).float().mean()
+            self.log(f"{mode}/acc_mean_pos", 1 + sim_argsort.float().mean(), prog_bar=True,
+                     on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, batch_size=self.hparams.batch_size)
+
+            self.log(f"{mode}/acc_top1", acc_top1, prog_bar=True,
+                     on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, batch_size=self.hparams.batch_size)
+            self.log(f"{mode}/acc_top5", acc_top5, prog_bar=True,
+                     on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, batch_size=self.hparams.batch_size)
+
+        self.log(f"{mode}/loss", dual_nll, prog_bar=True,
                  on_step=LOG_ON_STEP, on_epoch=LOG_ON_EPOCH, batch_size=self.hparams.batch_size)
         return dual_nll
 
