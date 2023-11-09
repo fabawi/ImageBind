@@ -133,11 +133,17 @@ class ImageBindTrain(L.LightningModule):
         for feats_idx, feats_tensor in enumerate(feats_tensors):
             # Calculate cosine similarity
             cos_sim = F.cosine_similarity(feats_tensor[:, None, :], feats_tensor[None, :, :], dim=-1)
+            
             # Mask out cosine similarity to itself
             self_mask = torch.eye(cos_sim.shape[0], dtype=torch.bool, device=cos_sim.device)
             cos_sim.masked_fill_(self_mask, -9e15)
+            # Mask out same-modality comparisons (assuming first half is images, second half is another modality or perturbed image in case of "self")
+            half_batch = cos_sim.shape[0] // 2
+            same_modality_mask = torch.cat([torch.zeros(half_batch, half_batch), torch.ones(half_batch, half_batch)], dim=1).bool().to(cos_sim.device)
+            cos_sim.masked_fill_(~same_modality_mask, -9e15)
+
             # Find positive example -> batch_size//2 away from the original example
-            pos_mask = self_mask.roll(shifts=cos_sim.shape[0] // 2, dims=0)
+            pos_mask = self_mask.roll(shifts=half_batch, dims=0)
             # InfoNCE loss
             cos_sim = cos_sim / temperatures[feats_idx]
             nll = -cos_sim[pos_mask] + torch.logsumexp(cos_sim, dim=-1)
