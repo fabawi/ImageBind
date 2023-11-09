@@ -179,20 +179,27 @@ class ImageBindTrain(L.LightningModule):
 
         dual_nll = False
         for feats_idx, feats_tensor in enumerate(feats_tensors):
+            # Calculate cosine similarity
             sim = F.cosine_similarity(feats_tensor[:, None, :], feats_tensor[None, :, :], dim=-1)
+
+            # Mask out cosine similarity to itself
             self_mask = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
             sim.masked_fill_(self_mask, -9e15)
-
+            # Mask out same-modality comparisons (assuming first half is images, second half is another modality or perturbed image in case of "self")
+            half_batch = sim.shape[0] // 2
+            same_modality_mask = torch.cat([torch.zeros(half_batch, half_batch), torch.ones(half_batch, half_batch)], dim=1).bool().to(sim.device)
+            sim.masked_fill_(~same_modality_mask, -9e15)
+            
             # If class_masking is set to True, mask out similar classes
             if self.hparams.class_masking:
                 # Create a mask for the same classes, where True means the pair is of the same class
                 class_mask = class_idx[:, None] == class_idx[None, :]
                 class_mask = class_mask.repeat(2, 2)
-                class_mask[self_mask.roll(shifts=sim.shape[0] // 2, dims=0)] = False  # Exclude diagonal elements
+                class_mask[self_mask.roll(shifts=half_batch, dims=0)] = False  # Exclude diagonal elements
                 # Mask out similarities of same class pairs
                 sim.masked_fill_(class_mask, -9e15)
 
-            pos_mask = self_mask.roll(shifts=sim.shape[0] // 2, dims=0)
+            pos_mask = self_mask.roll(shifts=half_batch, dims=0)
             sim = sim / temperatures[feats_idx]
             nll = -sim[pos_mask] + torch.logsumexp(sim, dim=-1)
             nll = nll.mean()
@@ -211,8 +218,8 @@ class ImageBindTrain(L.LightningModule):
 
                 ############################################ S. TEST #################################################
                 # Split the class indices, similarity matrix, and masks into two halves
-                half = sim.size(0) // 2
-                sim_a, sim_b = sim[:half, half:], sim[half:, :half]
+                half_batch = sim.size(0) // 2
+                sim_a, sim_b = sim[:half_batch, half_batch:], sim[half_batch:, :half_batch]
 
                 # For the first half, calculate metrics for the image to x_modality comparisons
                 unique_class, unique_indices = unique_with_index(class_idx)
